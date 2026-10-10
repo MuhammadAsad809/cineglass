@@ -142,6 +142,64 @@ function authPopupPlugin(): Plugin {
   };
 }
 
+/**
+ * Dev-server mount for the server-only CineJoy proxy. Production builds serve
+ * the same handler through `server/middleware/cinejoy-proxy.ts` (Nitro), which
+ * only exists in build/preview because vite.config.ts applies `nitro()` there.
+ */
+function cinejoyProxyPlugin(): Plugin {
+  return {
+    name: "app-builder:cinejoy-proxy",
+    apply: "serve",
+    configureServer(server) {
+      server.middlewares.use(async (req, res, next) => {
+        const rawUrl = req.url ?? "";
+        const pathOnly = rawUrl.split("?", 1)[0] ?? "";
+        if (!pathOnly.startsWith("/api/cinejoy/")) {
+          next();
+          return;
+        }
+        try {
+          const host = String(req.headers["x-forwarded-host"] ?? req.headers.host ?? "localhost:8080");
+          const proto = String(
+            req.headers["x-forwarded-proto"] ??
+              ((req.socket as { encrypted?: boolean } | undefined)?.encrypted ? "https" : "http"),
+          );
+          const requestHeaders = new Headers();
+          for (const [key, value] of Object.entries(req.headers)) {
+            if (value === undefined) continue;
+            if (Array.isArray(value)) for (const v of value) requestHeaders.append(key, v);
+            else requestHeaders.set(key, value);
+          }
+          const request = new Request(`${proto}://${host}${rawUrl}`, {
+            method: req.method ?? "GET",
+            headers: requestHeaders,
+          });
+          const mod = (await server.ssrLoadModule("/src/lib/cine/cinejoy-proxy.ts")) as {
+            handleCineJoyProxyRequest: (req: Request) => Promise<Response | null>;
+          };
+          const response = await mod.handleCineJoyProxyRequest(request);
+          if (!response) {
+            next();
+            return;
+          }
+          res.statusCode = response.status;
+          response.headers.forEach((value, key) => res.setHeader(key, value));
+          const body = Buffer.from(await response.arrayBuffer());
+          res.end(body);
+        } catch (err) {
+          console.error("[app-builder] /api/cinejoy handler failed:", err);
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.setHeader("content-type", "text/plain; charset=utf-8");
+            res.end("cinejoy proxy failed");
+          }
+        }
+      });
+    },
+  };
+}
+
 // `0.0.0.0:8080` is the live-preview contract — don't change host/port.
 // The dev server starts once `src/router.tsx` and `src/routes/` exist — see
 // AGENTS.md § "First scaffold".
@@ -163,6 +221,8 @@ export default defineConfig(({ command, isPreview }) => ({
     authPopupPlugin(),
     // Dev-only /__app-env, read by scripts/check-auth-invariant.mjs.
     appEnvPlugin(),
+    // Server-only CineJoy stream proxy (/api/cinejoy/*) in dev.
+    cinejoyProxyPlugin(),
     // PWA head + ?install=1 tutorial page; runs before Start/Nitro.
     grokPwaPlugin(),
     tailwindcss(),
