@@ -313,7 +313,7 @@ export async function fetchShelf(
   page: number,
 ): Promise<ShelfPage> {
   const path = shelf === "movies" ? "/movie/popular" : shelf === "tv" ? "/tv/popular" : "/trending/all/week";
-  const forced = shelf === "trending" ? undefined : shelf;
+  const forced = shelf === "movies" ? "movie" : shelf === "tv" ? "tv" : undefined;
   const data = await tmdb<TmdbPage>(key, path, { page: String(page), language: "en-US" });
   const titles = data.results
     .map((item) => mapListItem(item, forced))
