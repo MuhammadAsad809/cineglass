@@ -1,28 +1,10 @@
-/**
- * Server-only stream resolver for CineGlass.
- *
- * Resolves a TMDB movie / TV episode to a playable HLS master playlist on the
- * configured provider (CineJoy's nebula HLS host) and returns URLs that are
- * served through the app's own proxy (`/api/cinejoy/...`), so the browser never
- * talks to the provider directly and required Referer headers can be attached
- * server-side.
- *
- * Two resolution paths:
- *  1. HTTP-first (works on Vercel): fetches the provider's watch page and
- *     extracts the `/hls/<uuid>/master.m3u8` reference with a regex — no
- *     browser automation needed.
- *  2. Browser fallback (self-hosted only, where a Chromium binary exists):
- *     drives the page with Playwright via `CINEJOY_CHROMIUM_PATH`, intercepting
- *     the master playlist request. Enabled by setting `CINEJOY_ALLOW_BROWSER=1`.
- *
- * Nothing in this module may ever be imported from client code.
- */
+import { resolveWingStream } from "@/lib/cine/wing-native.server";
 
 const UPSTREAM_ORIGIN = "https://nebula.bright67.online";
 const CINEJOY_ORIGIN = "https://cinejoy.pk";
 const APP_PROXY_PREFIX = "/api/cinejoy";
 
-const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour cache for active streams
 const NEGATIVE_CACHE_TTL_MS = 60 * 1000;
 const REQUEST_TIMEOUT_MS = 15_000;
 const FETCH_USER_AGENT =
@@ -40,7 +22,6 @@ export class StreamResolveError extends Error {
   }
 }
 
-/** Minimal structural types for the optional playwright browser fallback. */
 type PlaywrightRoute = {
   request(): { url(): string; resourceType(): string };
   abort(): Promise<void>;
@@ -71,9 +52,7 @@ type PlaywrightChromium = {
 
 export type ResolvedStream = {
   kind: "hls";
-  /** App-relative proxied master playlist URL (safe to hand to hls.js). */
   src: string;
-  /** Proxied path prefix used to validate every manifest/segment URL. */
   proxyPrefix: string;
   cacheKey: string;
 };
@@ -94,10 +73,6 @@ function titleSlug(title: string): string {
     .replace(/-{2,}/g, "-");
 }
 
-function pad2(value: number): string {
-  return String(value).padStart(2, "0");
-}
-
 export function buildProviderPagePath(input: {
   mediaType: "movie" | "tv";
   tmdbId: number;
@@ -106,15 +81,13 @@ export function buildProviderPagePath(input: {
   season?: number;
   episode?: number;
 }): string {
-  const slug = titleSlug(input.title);
   if (input.mediaType === "tv") {
     if (!Number.isInteger(input.season) || !Number.isInteger(input.episode)) {
       throw new StreamResolveError("TV playback requires a season and episode number.", 400);
     }
-    return `/tv/${input.tmdbId}-${slug}/${input.season}/${input.episode}`;
+    return `/watch/tv/${input.tmdbId}/${input.season}/${input.episode}`;
   }
-  const yearSuffix = /^\d{4}$/.test(input.year ?? "") ? `-${input.year}` : "";
-  return `/movie/${input.tmdbId}-${slug}${yearSuffix}`;
+  return `/watch/movie/${input.tmdbId}`;
 }
 
 function extractMasterUuids(html: string): string[] {
@@ -157,20 +130,10 @@ async function fetchProviderHtml(pageUrl: string): Promise<string> {
   }
 }
 
-/**
- * Browser fallback. Only runs when explicitly enabled AND playwright resolves;
- * playwright is intentionally NOT a production dependency (it cannot run inside
- * Vercel's default serverless runtime), so this import always fails closed
- * there and the HTTP-first path remains the supported one.
- */
 async function scrapeMasterUuidWithBrowser(pageUrl: string): Promise<string> {
   if (process.env.CINEJOY_ALLOW_BROWSER !== "1") {
     throw new StreamResolveError("No stream is currently available for this title.", 404);
   }
-  // Playwright is intentionally NOT a production dependency (it cannot run in
-  // Vercel's default serverless runtime). Load it dynamically through the Node
-  // module cache so the browser bundle never references it and self-hosted
-  // deployments can install it on demand.
   const dynamicImport = new Function("specifier", "return import(specifier)") as (
     specifier: string,
   ) => Promise<{ chromium: PlaywrightChromium }>;
@@ -249,84 +212,7 @@ async function discoverUuid(cacheKey: string, pageUrl: string): Promise<string> 
   const html = await fetchProviderHtml(pageUrl);
   const uuids = extractMasterUuids(html);
   if (uuids.length > 0) return uuids[0]!;
-  // Page renders the player client-side: fall back to browser scraping when
-  // explicitly allowed (self-hosted deployments with a Chromium binary).
   return scrapeMasterUuidWithBrowser(pageUrl);
-}
-
-/**
- * Returns the provider UUID whose master playlist matches the expected
- * season/episode label. Movies accept the first verified stream; TV episodes
- * must match their own SxxExy variant so a movie or wrong-episode stream is
- * never played.
- */
-async function verifyAndSelectUuid(
-  uuids: string[],
-  expectation: { mediaType: "movie" | "tv"; season?: number; episode?: number },
-): Promise<string> {
-  for (const uuid of uuids.slice(0, 4)) {
-    let master: string;
-    try {
-      master = await fetchUpstreamText(`/hls/${uuid}/master.m3u8`);
-    } catch {
-      continue;
-    }
-    if (!master.trimStart().startsWith("#EXTM3U")) continue;
-    if (expectation.mediaType === "movie") return uuid;
-    if (
-      masterMatchesEpisode(master, expectation.season ?? -1, expectation.episode ?? -1) ||
-      (await anyVariantMatchesEpisode(uuid, master, expectation.season ?? -1, expectation.episode ?? -1))
-    ) {
-      return uuid;
-    }
-  }
-  throw new StreamResolveError("No stream for this exact season and episode was found.", 404);
-}
-
-const EPISODE_LABEL_PATTERN = /[sS]\d{1,2}[eE]\d{1,2}/g;
-
-function masterMatchesEpisode(master: string, season: number, episode: number): boolean {
-  const wanted = `s${pad2(season)}e${pad2(episode)}`.toLowerCase();
-  return [...master.matchAll(EPISODE_LABEL_PATTERN)].some((m) => m[0].toLowerCase() === wanted);
-}
-
-async function anyVariantMatchesEpisode(
-  uuid: string,
-  master: string,
-  season: number,
-  episode: number,
-): Promise<boolean> {
-  const variantPaths = [...master.matchAll(/^([^#\r\n][^\r\n]*)$/gm)]
-    .map((m) => m[1]!.trim())
-    .filter((p) => p && !/^https?:/i.test(p))
-    .slice(0, 4);
-  for (const variantPath of variantPaths) {
-    const suffix = `${uuid}/${variantPath.replace(/^\/+/, "")}`;
-    try {
-      const text = await fetchUpstreamText(`/hls/${suffix}`);
-      if (masterMatchesEpisode(text, season, episode)) return true;
-    } catch {
-      continue;
-    }
-  }
-  return false;
-}
-
-async function fetchUpstreamText(pathname: string): Promise<string> {
-  const url = new URL(pathname, UPSTREAM_ORIGIN);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, {
-      headers: { Origin: CINEJOY_ORIGIN, Referer: `${CINEJOY_ORIGIN}/` },
-      redirect: "manual",
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.text();
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 export async function resolvePlayableStream(input: {
@@ -349,26 +235,33 @@ export async function resolvePlayableStream(input: {
 
   let pending = inFlight.get(cacheKey);
   if (!pending) {
-    const pageUrl = `${CINEJOY_ORIGIN}${buildProviderPagePath(input)}`;
-    pending = discoverUuid(cacheKey, pageUrl)
-      .then(async (uuid) => {
-        const selected = await verifyAndSelectUuid([uuid], input);
-        uuidCache.set(cacheKey, { uuid: selected, expiresAt: Date.now() + CACHE_TTL_MS });
-        return selected;
-      })
-      .catch(async (firstError: unknown) => {
-        // One retry: re-discover (page HTML may contain multiple variants).
-        const html = await fetchProviderHtml(pageUrl).catch(() => "");
-        const uuids = extractMasterUuids(html);
-        if (uuids.length > 1) {
-          const selected = await verifyAndSelectUuid(uuids, input);
-          uuidCache.set(cacheKey, { uuid: selected, expiresAt: Date.now() + CACHE_TTL_MS });
-          return selected;
+    pending = (async () => {
+      try {
+        const wing = await resolveWingStream({
+          mediaType: input.mediaType,
+          tmdbId: input.tmdbId,
+          season: input.season,
+          episode: input.episode,
+        });
+        if (wing && wing.uuid) {
+          uuidCache.set(cacheKey, { uuid: wing.uuid, expiresAt: Date.now() + CACHE_TTL_MS });
+          return wing.uuid;
         }
+      } catch (err) {
+        console.warn("[stream-resolver] Native Wing resolution failed, trying fallback:", err);
+      }
+
+      const pageUrl = `${CINEJOY_ORIGIN}${buildProviderPagePath(input)}`;
+      try {
+        const uuid = await discoverUuid(cacheKey, pageUrl);
+        uuidCache.set(cacheKey, { uuid, expiresAt: Date.now() + CACHE_TTL_MS });
+        return uuid;
+      } catch (fallbackError) {
         uuidCache.set(cacheKey, { uuid: "", expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS });
-        throw firstError;
-      })
-      .finally(() => inFlight.delete(cacheKey));
+        throw fallbackError;
+      }
+    })().finally(() => inFlight.delete(cacheKey));
+
     inFlight.set(cacheKey, pending);
   }
 
@@ -383,8 +276,8 @@ function finalize(uuid: string, cacheKey: string, input: Parameters<typeof resol
   const params = new URLSearchParams({ title: input.title, key: cacheKey });
   if (/^\d{4}$/.test(input.year ?? "")) params.set("year", input.year!);
   if (input.mediaType === "tv") {
-    params.set("season", String(input.season));
-    params.set("episode", String(input.episode));
+    params.set("season", String(input.season ?? 1));
+    params.set("episode", String(input.episode ?? 1));
   }
   const proxyPrefix = `${APP_PROXY_PREFIX}/hls/${uuid}/`;
   return {

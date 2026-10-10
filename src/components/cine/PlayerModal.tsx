@@ -13,14 +13,19 @@ type PlayerServer = {
   available?: boolean;
 };
 
-const CINEJOY_TMDB_ID = "969681";
-const CINEJOY_PROXY_HLS_URL =
-  "/api/cinejoy/hls/eeea82d4-605b-4469-a754-f19d1c443ad6/master.m3u8";
+function cineJoyMovieUrl(tmdbId: string, title: string, year: string): string {
+  const query = new URLSearchParams();
+  if (title) query.set("title", title);
+  if (year) query.set("year", year);
+  const q = query.toString();
+  return `/api/cinejoy/resolve/${tmdbId}/master.m3u8${q ? `?${q}` : ""}`;
+}
 
-function cineJoyUrl(tmdbId: string, title: string, year: string): string {
-  if (tmdbId === CINEJOY_TMDB_ID) return CINEJOY_PROXY_HLS_URL;
-  const query = new URLSearchParams({ title, year });
-  return `/api/cinejoy/resolve/${tmdbId}/master.m3u8?${query.toString()}`;
+function cineJoyTvUrl(tmdbId: string, season: number, episode: number, title: string): string {
+  const query = new URLSearchParams();
+  if (title) query.set("title", title);
+  const q = query.toString();
+  return `/api/cinejoy/resolve-tv/${tmdbId}/${season}/${episode}/master.m3u8${q ? `?${q}` : ""}`;
 }
 
 function getTmdbId(title: { tmdbId?: number; id: string; source: string }): string | null {
@@ -44,6 +49,9 @@ function HlsVideo({ url, onFailure }: { url: string; onFailure: () => void }) {
 
       if (Hls.isSupported()) {
         hls = new Hls({ capLevelToPlayerSize: true, maxBufferLength: 30 });
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          video.play().catch(() => {});
+        });
         hls.on(Hls.Events.ERROR, (_event, data) => {
           if (data.fatal && !cancelled) onFailure();
         });
@@ -54,6 +62,7 @@ function HlsVideo({ url, onFailure }: { url: string; onFailure: () => void }) {
 
       if (video.canPlayType("application/vnd.apple.mpegurl")) {
         video.src = url;
+        video.play().catch(() => {});
         return;
       }
       onFailure();
@@ -76,6 +85,7 @@ function HlsVideo({ url, onFailure }: { url: string; onFailure: () => void }) {
       ref={videoRef}
       className="h-full w-full bg-black"
       controls
+      autoPlay
       playsInline
       preload="metadata"
       onError={onFailure}
@@ -100,31 +110,32 @@ export function PlayerModal() {
 
   const servers = useMemo<PlayerServer[]>(() => {
     if (!tmdbId || !mediaType) return [];
-    const cinejoyServer: PlayerServer[] =
-      mediaType === "movie"
-        ? [
-            {
-              id: "cinejoy",
-              name: "CineJoy",
-              url: cineJoyUrl(tmdbId, movieTitle, movieYear),
-              kind: "hls",
-              available: true,
-            },
-          ]
-        : [];
     if (mediaType === "tv") {
       if (!episodeNumber) return [];
       return [
         { id: "vidlink", name: "VidLink Pro", url: `https://vidlink.pro/tv/${tmdbId}/${seasonNumber}/${episodeNumber}` },
         { id: "embed-su", name: "Embed.su", url: `https://embed.su/embed/tv/${tmdbId}/${seasonNumber}/${episodeNumber}` },
         { id: "vidsrc", name: "VidSrc.cc", url: `https://vidsrc.cc/v2/embed/tv/${tmdbId}/${seasonNumber}/${episodeNumber}` },
+        {
+          id: "cinejoy",
+          name: "CineJoy",
+          url: cineJoyTvUrl(tmdbId, seasonNumber, episodeNumber, movieTitle),
+          kind: "hls",
+          available: true,
+        },
       ];
     }
     return [
       { id: "vidlink", name: "VidLink Pro", url: `https://vidlink.pro/movie/${tmdbId}` },
       { id: "embed-su", name: "Embed.su", url: `https://embed.su/embed/movie/${tmdbId}` },
       { id: "vidsrc", name: "VidSrc.cc", url: `https://vidsrc.cc/v2/embed/movie/${tmdbId}` },
-      ...cinejoyServer,
+      {
+        id: "cinejoy",
+        name: "CineJoy",
+        url: cineJoyMovieUrl(tmdbId, movieTitle, movieYear),
+        kind: "hls",
+        available: true,
+      },
     ];
   }, [tmdbId, mediaType, seasonNumber, episodeNumber, movieTitle, movieYear]);
 
