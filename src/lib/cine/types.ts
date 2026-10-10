@@ -89,6 +89,15 @@ export interface Playback {
   error?: string;
 }
 
+/** Playable stream returned by /api/cinejoy/resolve. */
+export interface ResolvedPlaybackStream {
+  kind: "hls" | "mp4";
+  src: string;
+  /** Proxied path prefix every manifest/segment URL must stay inside. */
+  proxyPrefix: string;
+  cacheKey: string;
+}
+
 export interface BrowseSearch {
   shelf: Shelf;
   library: LibraryMode;

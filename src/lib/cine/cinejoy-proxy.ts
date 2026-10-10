@@ -1,10 +1,24 @@
-import type { Browser } from "playwright";
+/**
+ * Server-only CineJoy HLS proxy. Mounted from `server/middleware/cinejoy-proxy.ts`
+ * (Nitro global middleware in production builds) and from a dev-server plugin in
+ * `vite.config.ts`. Never import this module from client code.
+ *
+ * Responsibilities:
+ *  - Serve `/api/cinejoy/resolve?...` → JSON with a playable, proxied stream URL.
+ *  - Serve `/api/cinejoy/hls/<uuid>/<suffix>` → upstream manifests/segments with
+ *    the provider-required Origin/Referer headers, rewriting every manifest URI
+ *    so hls.js only ever requests same-origin proxied URLs.
+ */
+import {
+  resolvePlayableStream,
+  StreamResolveError,
+} from "@/lib/cine/stream-resolver.server";
 
 const UPSTREAM_ORIGIN = "https://nebula.bright67.online";
 const CINEJOY_ORIGIN = "https://cinejoy.pk";
 const APP_PROXY_PREFIX = "/api/cinejoy";
-const FIXED_STREAM_PREFIX = "/hls/eeea82d4-605b-4469-a754-f19d1c443ad6/";
-const CACHE_TTL_MS = 10 * 60 * 1000;
+const RESOLVE_PATH = `${APP_PROXY_PREFIX}/resolve`;
+const HLS_PATH_PREFIX = `${APP_PROXY_PREFIX}/hls/`;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PASSTHROUGH_RESPONSE_HEADERS = [
   "accept-ranges",
@@ -14,18 +28,9 @@ const PASSTHROUGH_RESPONSE_HEADERS = [
   "etag",
   "last-modified",
 ];
+const UPSTREAM_TIMEOUT_MS = 20_000;
 
-type ResolvedStream = { uuid: string; expiresAt: number };
-type RewriteContext = {
-  upstreamPrefix: string;
-  movieId?: string;
-  title?: string;
-  year?: string;
-};
-
-const resolvedStreams = new Map<string, ResolvedStream>();
-const inFlightResolutions = new Map<string, Promise<string>>();
-let browserPromise: Promise<Browser> | undefined;
+type RewriteContext = { upstreamPrefix: string };
 
 function errorResponse(message: string, status: number): Response {
   return new Response(message, {
@@ -38,12 +43,23 @@ function errorResponse(message: string, status: number): Response {
   });
 }
 
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
 function isManifestPath(pathname: string): boolean {
   const leaf = pathname.slice(pathname.lastIndexOf("/") + 1).toLowerCase();
   return leaf.endsWith(".m3u8") || leaf === "playlist.jpg";
 }
 
-function safeManifestSuffix(pathname: string, upstreamPrefix: string): string | null {
+function safeSuffix(pathname: string, upstreamPrefix: string): string | null {
   if (!pathname.startsWith(upstreamPrefix)) return null;
   const suffix = pathname.slice(upstreamPrefix.length);
   if (
@@ -67,18 +83,10 @@ function rewriteResourceUri(
   if (target.origin !== UPSTREAM_ORIGIN) {
     throw new Error("Playlist resource is outside the configured HLS host");
   }
-  const suffix = safeManifestSuffix(target.pathname, context.upstreamPrefix);
+  const suffix = safeSuffix(target.pathname, context.upstreamPrefix);
   if (!suffix) throw new Error("Playlist resource is outside the resolved stream path");
-
-  const localPath = context.movieId
-    ? `${APP_PROXY_PREFIX}/resolve/${context.movieId}/${suffix}`
-    : `${APP_PROXY_PREFIX}${target.pathname}`;
-  const localUrl = new URL(localPath, appOrigin);
-  const query = new URLSearchParams();
-  if (context.title) query.set("title", context.title);
-  if (context.year) query.set("year", context.year);
-  if (target.search) query.set("sourceSearch", target.search);
-  localUrl.search = query.toString();
+  const localUrl = new URL(`${APP_PROXY_PREFIX}/hls/${suffix}`, appOrigin);
+  if (target.search) localUrl.search = target.search;
   return localUrl.toString();
 }
 
@@ -111,123 +119,6 @@ function proxyContentType(pathname: string, upstreamType: string | null): string
   return upstreamType || "application/octet-stream";
 }
 
-function titleSlug(title: string): string {
-  return title
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .replace(/-{2,}/g, "-");
-}
-
-async function getBrowser(): Promise<Browser> {
-  if (!browserPromise) {
-    browserPromise = (async () => {
-      const { chromium } = await import("playwright");
-      return chromium.launch({
-        headless: true,
-        executablePath: process.env.CINEJOY_CHROMIUM_PATH || "/usr/bin/chromium",
-        args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      });
-    })().catch((error) => {
-      browserPromise = undefined;
-      throw error;
-    });
-  }
-  return browserPromise;
-}
-
-async function scrapeStreamUuid(movieId: string, title: string, year: string): Promise<string> {
-  const browser = await getBrowser();
-  const context = await browser.newContext({ locale: "en-US" });
-  let resolveDetected!: (uuid: string) => void;
-  const detectedUuid = new Promise<string>((resolve) => {
-    resolveDetected = resolve;
-  });
-  try {
-    await context.route("**/*", async (route) => {
-      const request = route.request();
-      const requestUrl = new URL(request.url());
-      const masterMatch =
-        requestUrl.origin === UPSTREAM_ORIGIN &&
-        requestUrl.pathname.match(/^\/hls\/([0-9a-f-]{36})\/master\.m3u8$/i);
-      if (masterMatch && UUID_PATTERN.test(masterMatch[1])) {
-        resolveDetected(masterMatch[1]);
-        await route.abort();
-        return;
-      }
-      if (
-        requestUrl.origin === UPSTREAM_ORIGIN &&
-        requestUrl.pathname.startsWith("/hls/")
-      ) {
-        await route.abort();
-        return;
-      }
-      if (
-        request.resourceType() === "media" ||
-        ["a.wing.st", "trailer.wing.st", "server.wing.st", "subs.wing.st", "imdb.wing.st"].includes(
-          requestUrl.hostname,
-        )
-      ) {
-        await route.abort();
-        return;
-      }
-      await route.continue();
-    });
-
-    const page = await context.newPage();
-    page.on("popup", (popup) => {
-      void popup.close().catch(() => undefined);
-    });
-    const slug = titleSlug(title);
-    const yearSuffix = /^\d{4}$/.test(year) ? `-${year}` : "";
-    const titleUrl = `${CINEJOY_ORIGIN}/movie/${movieId}-${slug}${yearSuffix}`;
-    await page.goto(titleUrl, { waitUntil: "domcontentloaded", timeout: 25_000 });
-    const playButton = page.getByRole("button", { name: /^Play$/i }).first();
-    await playButton.waitFor({ state: "visible", timeout: 15_000 });
-    await playButton.click({ timeout: 10_000 });
-
-    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_resolve, reject) => {
-      timeoutHandle = setTimeout(() => reject(new Error("CineJoy did not expose a playable stream")), 25_000);
-    });
-    try {
-      const uuid = await Promise.race([detectedUuid, timeout]);
-      return uuid;
-    } finally {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-    }
-  } finally {
-    await context.close().catch(() => undefined);
-  }
-}
-
-async function resolveStreamUuid(movieId: string, title: string, year: string): Promise<string> {
-  const cached = resolvedStreams.get(movieId);
-  if (cached && cached.expiresAt > Date.now()) return cached.uuid;
-  const pending = inFlightResolutions.get(movieId);
-  if (pending) return pending;
-
-  const promise = scrapeStreamUuid(movieId, title, year)
-    .then((uuid) => {
-      resolvedStreams.set(movieId, { uuid, expiresAt: Date.now() + CACHE_TTL_MS });
-      return uuid;
-    })
-    .finally(() => inFlightResolutions.delete(movieId));
-  inFlightResolutions.set(movieId, promise);
-  return promise;
-}
-
-function validateSourceSearch(value: string | null): string {
-  if (!value) return "";
-  if (!value.startsWith("?") || value.length > 2_000 || /[\r\n]/.test(value)) {
-    throw new Error("Invalid upstream query");
-  }
-  return value;
-}
-
 async function proxyUpstream(
   request: Request,
   requestUrl: URL,
@@ -237,21 +128,28 @@ async function proxyUpstream(
   const upstreamHeaders = new Headers({
     Origin: CINEJOY_ORIGIN,
     Referer: `${CINEJOY_ORIGIN}/`,
+    "User-Agent":
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
   });
   for (const header of ["range", "if-range"]) {
     const value = request.headers.get(header);
     if (value) upstreamHeaders.set(header, value);
   }
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   let upstream: Response;
   try {
     upstream = await fetch(upstreamUrl, {
       method: request.method,
       headers: upstreamHeaders,
       redirect: "manual",
+      signal: controller.signal,
     });
   } catch {
     return errorResponse("CineJoy upstream fetch failed", 502);
+  } finally {
+    clearTimeout(timer);
   }
 
   if (upstream.status >= 300 && upstream.status < 400) {
@@ -293,14 +191,7 @@ async function proxyUpstream(
   return new Response(upstream.body, { status: upstream.status, headers });
 }
 
-export async function handleCineJoyProxyRequest(request: Request): Promise<Response | null> {
-  const requestUrl = new URL(request.url);
-  if (!requestUrl.pathname.startsWith(`${APP_PROXY_PREFIX}/`)) return null;
-
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    return errorResponse("Method not allowed", 405);
-  }
-
+function sameOriginGuard(request: Request, requestUrl: URL): Response | null {
   const origin = request.headers.get("origin");
   if (origin && origin !== requestUrl.origin) {
     return errorResponse("Cross-origin requests are not allowed", 403);
@@ -315,53 +206,86 @@ export async function handleCineJoyProxyRequest(request: Request): Promise<Respo
       return errorResponse("Invalid referrer", 403);
     }
   }
+  return null;
+}
 
-  const dynamicPrefix = `${APP_PROXY_PREFIX}/resolve/`;
-  if (requestUrl.pathname.startsWith(dynamicPrefix)) {
-    const match = requestUrl.pathname.slice(dynamicPrefix.length).match(/^(\d{1,12})\/(.+)$/);
-    if (!match) return errorResponse("Invalid CineJoy movie route", 404);
-    const [, movieId, suffix] = match;
-    if (
-      suffix.includes("\\") ||
-      suffix.includes("%") ||
-      suffix.split("/").some((part) => !part || part === "." || part === ".." || !/^[a-z0-9._-]+$/i.test(part))
-    ) {
+async function handleResolve(request: Request, requestUrl: URL): Promise<Response> {
+  const mediaType = requestUrl.searchParams.get("type");
+  const tmdbRaw = requestUrl.searchParams.get("tmdb");
+  const title = (requestUrl.searchParams.get("title") ?? "").trim();
+  const year = (requestUrl.searchParams.get("year") ?? "").trim();
+  const seasonRaw = requestUrl.searchParams.get("season");
+  const episodeRaw = requestUrl.searchParams.get("episode");
+
+  if (mediaType !== "movie" && mediaType !== "tv") {
+    return errorResponse("Query parameter type must be 'movie' or 'tv'.", 400);
+  }
+  const tmdbId = Number(tmdbRaw);
+  if (!Number.isSafeInteger(tmdbId) || tmdbId <= 0) {
+    return errorResponse("A valid numeric TMDb id is required.", 400);
+  }
+  if (!title || title.length > 180) {
+    return errorResponse("A title between 1 and 180 characters is required.", 400);
+  }
+  if (year && !/^\d{4}$/.test(year)) {
+    return errorResponse("Year must be a four-digit number.", 400);
+  }
+  const season = seasonRaw === null ? undefined : Number(seasonRaw);
+  const episode = episodeRaw === null ? undefined : Number(episodeRaw);
+  if (mediaType === "tv") {
+    if (!Number.isInteger(season) || (season as number) < 1 || (season as number) > 200) {
+      return errorResponse("TV resolution requires a valid season number.", 400);
+    }
+    if (!Number.isInteger(episode) || (episode as number) < 1 || (episode as number) > 1000) {
+      return errorResponse("TV resolution requires a valid episode number.", 400);
+    }
+  }
+
+  try {
+    const stream = await resolvePlayableStream({
+      mediaType,
+      tmdbId,
+      title,
+      year: year || undefined,
+      season,
+      episode,
+    });
+    return jsonResponse(stream);
+  } catch (error) {
+    if (error instanceof StreamResolveError) {
+      return errorResponse(error.message, error.status);
+    }
+    return errorResponse("Could not resolve a playable stream for this title.", 502);
+  }
+}
+
+export async function handleCineJoyProxyRequest(request: Request): Promise<Response | null> {
+  const requestUrl = new URL(request.url);
+  if (!requestUrl.pathname.startsWith(`${APP_PROXY_PREFIX}/`)) return null;
+
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return errorResponse("Method not allowed", 405);
+  }
+
+  const guard = sameOriginGuard(request, requestUrl);
+  if (guard) return guard;
+
+  if (requestUrl.pathname === RESOLVE_PATH || `${requestUrl.pathname}/` === `${RESOLVE_PATH}/`) {
+    return handleResolve(request, requestUrl);
+  }
+
+  if (requestUrl.pathname.startsWith(HLS_PATH_PREFIX)) {
+    const rest = requestUrl.pathname.slice(HLS_PATH_PREFIX.length);
+    const slash = rest.indexOf("/");
+    const uuid = (slash === -1 ? rest : rest.slice(0, slash)).toLowerCase();
+    const suffix = slash === -1 ? "" : rest.slice(slash + 1);
+    if (!UUID_PATTERN.test(uuid) || !safeSuffix(`/hls/${uuid}/${suffix}`, `/hls/${uuid}/`)) {
       return errorResponse("Invalid HLS resource path", 404);
     }
-
-    const title = (requestUrl.searchParams.get("title") ?? "").trim();
-    const year = (requestUrl.searchParams.get("year") ?? "").trim();
-    if (!title || title.length > 180 || (year && !/^\d{4}$/.test(year))) {
-      return errorResponse("Movie title and year are required to resolve CineJoy", 400);
-    }
-
-    try {
-      const uuid = await resolveStreamUuid(movieId, title, year);
-      const upstreamPrefix = `/hls/${uuid}/`;
-      const sourceSearch = validateSourceSearch(requestUrl.searchParams.get("sourceSearch"));
-      const upstreamUrl = new URL(`${upstreamPrefix}${suffix}${sourceSearch}`, UPSTREAM_ORIGIN);
-      return proxyUpstream(request, requestUrl, upstreamUrl, {
-        upstreamPrefix,
-        movieId,
-        title,
-        year,
-      });
-    } catch {
-      return errorResponse("CineJoy could not resolve a stream for this movie", 404);
-    }
+    const upstreamPrefix = `/hls/${uuid}/`;
+    const upstreamUrl = new URL(`/hls/${uuid}/${suffix}${requestUrl.search}`, UPSTREAM_ORIGIN);
+    return proxyUpstream(request, requestUrl, upstreamUrl, { upstreamPrefix });
   }
 
-  const staticPath = requestUrl.pathname.slice(APP_PROXY_PREFIX.length);
-  if (
-    !staticPath.startsWith(FIXED_STREAM_PREFIX) ||
-    staticPath.includes("\\") ||
-    staticPath.includes("%") ||
-    staticPath.split("/").includes("..")
-  ) {
-    return errorResponse("Path not allowed", 404);
-  }
-  const upstreamUrl = new URL(`${staticPath}${requestUrl.search}`, UPSTREAM_ORIGIN);
-  return proxyUpstream(request, requestUrl, upstreamUrl, {
-    upstreamPrefix: FIXED_STREAM_PREFIX,
-  });
+  return errorResponse("Path not allowed", 404);
 }
