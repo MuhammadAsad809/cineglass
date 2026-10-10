@@ -1,0 +1,55 @@
+Act as a Senior Principal Frontend Architect specializing in Apple iOS / Spatial OS Design Systems. Build a complete, production-ready, ultra-sleek Web Streaming Application in React TypeScript (.tsx) featuring a native "iOS Liquid Glass" (Glassmorphism) aesthetic, powered by Tailwind CSS, Lucide React Icons, and Framer Motion / fluid CSS transitions.
+
+### 🎨 DESIGN SYSTEM: iOS LIQUID GLASS (GLASSMORPHISM)
+1. Aesthetics:
+   - Ultra-refined translucent dark glass surfaces (`backdrop-blur-2xl bg-black/40 border border-white/10 shadow-[0_8px_32px_0_rgba(0,0,0,0.37)]`).
+   - Ambient Glow: Deep background blur mesh gradients (vibrant radial blur spheres in magenta, cyan, and deep indigo shifting gently in the background).
+   - Glass Cards & Modals: Rounded 2XL/3XL corners, thin specular light borders (`border-t-white/20 border-l-white/10 border-b-black/30 border-r-black/20`), pill-shaped glossy action buttons (`rounded-full bg-white/15 hover:bg-white/25 backdrop-blur-md transition-all duration-300`).
+   - Typography: Ultra-clean SF Pro style fonts, high contrast white text with subtle zinc secondary text.
+   - Micro-Interactions: Haptic-like hover scaling (`hover:scale-[1.02] active:scale-[0.98]`), glossy highlight sweeps on hover, smooth spring physics transitions.
+
+### ⚙️ ARCHITECTURE & CORE REQUIREMENTS:
+1. Architecture: 100% Serverless / Client-Side (No custom backend).
+2. Metadata Provider: The Movie Database (TMDb) v3 REST API.
+3. Streaming Provider Fallback Network (Ad-Shielded Embeds):
+   - Server 1 (VidLink Pro): `https://vidlink.pro/movie/{tmdb_id}` | TV: `https://vidlink.pro/tv/{tmdb_id}/{season}/{episode}`
+   - Server 2 (Embed.su): `https://embed.su/embed/movie/{tmdb_id}` | TV: `https://embed.su/embed/tv/{tmdb_id}/{season}/{episode}`
+   - Server 3 (VidSrc.cc): `https://vidsrc.cc/v2/embed/movie/{tmdb_id}` | TV: `https://vidsrc.cc/v2/embed/tv/{tmdb_id}/{season}/{episode}`
+   - Server 4 (MoviesAPI): `https://moviesapi.club/movie/{tmdb_id}`
+   - Server 5 (SmashyStream): `https://embed.smashystream.com/playere.php?tmdb={tmdb_id}`
+
+### 🧩 COMPONENT SPECIFICATIONS (.tsx):
+
+#### 1. Glass Navigation Bar (`Navbar.tsx`):
+- Floating liquid glass pill navbar pinned to top with `backdrop-blur-3xl bg-black/30 border border-white/10 shadow-2xl rounded-full my-4 mx-auto max-w-6xl px-6 py-3 z-50`.
+- Glowing Brand Logo ("CineGlass" with glossy film icon).
+- Glass Search Bar with live debounce and instant blur backdrop dropdown.
+- Category Pills (Trending, Movies, TV Shows, Favorites).
+
+#### 2. Hero Glass Stage (`HeroBanner.tsx`):
+- Ambient backdrop image with liquid gradient overlay (`bg-gradient-to-t from-[#09090b] via-transparent to-black/60`).
+- Glass info card over the banner featuring TMDb backdrop, rating badge (`backdrop-blur-xl bg-amber-500/20 text-amber-300 border border-amber-500/30`), overview, and glossy "Play Now" / "Details" buttons.
+
+#### 3. Content Grid & Liquid Card (`MovieGrid.tsx`, `MovieCard.tsx`):
+- Grid layout (`grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-6`).
+- Movie/TV Poster with 3D glass shine reflection effect on hover, smooth border highlight glow, and year/rating pill badge.
+
+#### 4. TV Show Season & Episode Picker (`SeasonSelector.tsx`):
+- Dynamic dropdown/pills for Season selection.
+- Liquid glass episode cards showing episode thumbnail, number, title, and overview.
+
+#### 5. Liquid Glass Player Modal (`PlayerModal.tsx`):
+- Fullscreen dark glass overlay with close button (`rounded-full p-3 bg-white/10 hover:bg-white/20 backdrop-blur-xl border border-white/20`).
+- Embedded iframe with ad-block security sandbox (`sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"`).
+- Glass Server Switcher Bar: Floating floating pill dropdown below the player allowing seamless switching between VidLink, Embed.su, VidSrc.cc, and SmashyStream without restarting state.
+
+#### 6. Settings & API Modal (`SettingsModal.tsx`):
+- Allows entering custom TMDb API Key (with pre-configured demo key fallback).
+
+### 🛠️ STRICT CODING RULES:
+- Full React TypeScript (.tsx) file structure with strict typing (`interface Movie`, `interface TVShow`, `interface Server`).
+- Explicit imports for `react`, `lucide-react`, and Tailwind CSS helper classes.
+- DO NOT leave placeholders, `// TODO` statements, or omitted sections. Write 100% of the functional logic.
+- Ensure full error handling for missing poster images (`https://via.placeholder.com/500x750?text=No+Poster`) and broken video servers.
+
+Generate the complete, pristine iOS Liquid Glass React TypeScript (.tsx) codebase now.
