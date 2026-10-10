@@ -10,6 +10,9 @@ import {
   type TitleSnapshot,
 } from "@/lib/cine/types";
 
+// Public client key approved by the app owner; requests and bundles expose it.
+const DEFAULT_TMDB_API_KEY = "8476a7ab80ad76f0936744df0430e67c";
+
 interface CineState {
   apiKey: string;
   region: string;
@@ -17,7 +20,6 @@ interface CineState {
   hydrated: boolean;
   playing: Playback | null;
   settingsOpen: boolean;
-  setApiKey: (apiKey: string) => void;
   setRegion: (region: string) => void;
   toggleFavorite: (title: TitleSnapshot) => void;
   openPlayer: (title: Title, episode?: Episode) => void;
@@ -60,13 +62,12 @@ function normalizeFavorite(value: TitleSnapshot): TitleSnapshot {
 export const useCine = create<CineState>()(
   persist(
     (set, get) => ({
-      apiKey: "",
+      apiKey: DEFAULT_TMDB_API_KEY,
       region: "US",
       favorites: [],
       hydrated: false,
       playing: null,
       settingsOpen: false,
-      setApiKey: (apiKey) => set({ apiKey: apiKey.trim() }),
       setRegion: (region) => set({ region }),
       toggleFavorite: (title) => {
         const snapshot = normalizeFavorite(toSnapshot(title));
@@ -112,11 +113,19 @@ export const useCine = create<CineState>()(
     }),
     {
       name: "cineglass",
-      version: 1,
+      version: 2,
       skipHydration: true,
       storage: createJSONStorage(() => safeStorage),
+      migrate: (persisted) => {
+        const saved = (persisted ?? {}) as Partial<CineState>;
+        return {
+          region: typeof saved.region === "string" && /^[A-Z]{2}$/.test(saved.region) ? saved.region : "US",
+          favorites: Array.isArray(saved.favorites)
+            ? saved.favorites.filter(isTitleSnapshot).map(normalizeFavorite)
+            : [],
+        };
+      },
       partialize: (state) => ({
-        apiKey: state.apiKey,
         region: state.region,
         favorites: state.favorites,
       }),
@@ -127,7 +136,6 @@ export const useCine = create<CineState>()(
           : [];
         return {
           ...current,
-          apiKey: typeof saved.apiKey === "string" ? saved.apiKey : "",
           region: typeof saved.region === "string" && /^[A-Z]{2}$/.test(saved.region) ? saved.region : "US",
           favorites,
         };

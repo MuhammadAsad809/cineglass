@@ -9,7 +9,7 @@ import { regionName } from "@/lib/cine/regions";
 import { useCine } from "@/lib/cine/store";
 import { fetchSeason, fetchTitleDetail, formatTmdbError } from "@/lib/cine/tmdb";
 import type { Episode, Title, WatchProvider } from "@/lib/cine/types";
-import { hasLiveKey, usePlayTitle } from "@/lib/cine/use-play";
+import { usePlayTitle } from "@/lib/cine/use-play";
 
 function initials(name: string): string {
   return name
@@ -24,7 +24,6 @@ export function DetailView({ kind, id }: { kind: string; id: string }) {
   const hydrated = useCine((state) => state.hydrated);
   const apiKey = useCine((state) => state.apiKey);
   const region = useCine((state) => state.region);
-  const setSettingsOpen = useCine((state) => state.setSettingsOpen);
   const play = usePlayTitle();
   const navigate = useNavigate();
   const router = useRouter();
@@ -32,7 +31,7 @@ export function DetailView({ kind, id }: { kind: string; id: string }) {
   const validKind = kind === "movie" || kind === "tv" || kind === "atelier";
   const atelier = kind === "atelier" ? getAtelier(`atelier:${id}`) : undefined;
   const liveId = kind === "movie" || kind === "tv" ? Number(id) : NaN;
-  const canFetch = kind !== "atelier" && Number.isInteger(liveId) && hasLiveKey(apiKey);
+  const canFetch = kind !== "atelier" && Number.isInteger(liveId);
 
   const detail = useQuery({
     queryKey: ["title", apiKey, kind, id, region],
@@ -76,16 +75,6 @@ export function DetailView({ kind, id }: { kind: string; id: string }) {
   }
   if (kind === "atelier" && !atelier) {
     return <Missing onBack={goBack} message="This Atelier title isn't on the shelf." />;
-  }
-  if (kind !== "atelier" && !hasLiveKey(apiKey)) {
-    return (
-      <Missing
-        onBack={goBack}
-        message="This title lives in the TMDb catalog. Add your key to open it."
-        actionLabel="Open settings"
-        onAction={() => setSettingsOpen(true)}
-      />
-    );
   }
   if (kind !== "atelier" && detail.isLoading) {
     return (
@@ -162,11 +151,11 @@ export function DetailView({ kind, id }: { kind: string; id: string }) {
 
         <section className="mt-10">
           <h2 className="text-xl font-semibold tracking-tight">Where to watch</h2>
-          {title.source === "atelier" ? (
-            <p className="mt-2 max-w-2xl text-sm text-muted">
-              Atelier pictures screen here as trailers and motion stills. Connect a TMDb key to see storefronts for
-              released films in {regionName(region)}.
-            </p>
+        {title.source === "atelier" ? (
+          <p className="mt-2 max-w-2xl text-sm text-muted">
+            Atelier pictures are original to this app. TMDb watch availability is shown automatically for catalog titles
+            in {regionName(region)}.
+          </p>
           ) : (title.providers?.length ?? 0) === 0 ? (
             <p className="mt-2 max-w-2xl text-sm text-muted">
               Nothing is listed for {regionName(region)} right now. You can change region in Settings.
