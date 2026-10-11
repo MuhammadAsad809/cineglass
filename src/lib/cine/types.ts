@@ -6,7 +6,7 @@ export type StillFocus = "left" | "center" | "right" | "top";
 export interface Server {
   id: string;
   name: string;
-  kind: "trailer" | "teaser" | "clip" | "featurette" | "prelude";
+  kind: "trailer" | "teaser" | "clip" | "featurette" | "prelude" | "mp4" | "hls";
   youtubeKey?: string;
   src?: string;
 }
