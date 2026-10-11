@@ -3,7 +3,11 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, Languages, Loader2, Play, X } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useCine } from "@/lib/cine/store";
-import { resolveAoneRoomStreams, type AoneRoomStream } from "@/lib/cine/aoneroom-streams";
+import {
+  resolveAoneRoomStreams,
+  resolveAoneRoomStreamsByTitle,
+  type AoneRoomStream,
+} from "@/lib/cine/aoneroom-streams";
 import type { MediaType, Title } from "@/lib/cine/types";
 
 export type AudioTrackInfo = {
@@ -28,19 +32,59 @@ function aoneRoomSubjectId(title: Title): string | null {
   return typeof raw === "string" || typeof raw === "number" ? String(raw) : null;
 }
 
-function Mp4Video({ url }: { url: string }) {
+function Mp4Video({
+  url,
+  onAudioTracks,
+  activeAudioTrack,
+  onAudioTrackSwitched,
+}: {
+  url: string;
+  onAudioTracks?: (tracks: AudioTrackInfo[]) => void;
+  activeAudioTrack?: number;
+  onAudioTrackSwitched?: (id: number) => void;
+}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     video.src = url;
     void video.play().catch(() => {});
+    // Surface native multi-audio tracks (Safari / Chrome report them after
+    // loadedmetadata) so the language switcher works for MP4 streams too.
+    const reportTracks = () => {
+      if (!onAudioTracks) return;
+      const list = video.audioTracks;
+      if (!list || list.length === 0) {
+        onAudioTracks([]);
+        return;
+      }
+      const tracks: AudioTrackInfo[] = Array.from(list).map((track, index) => ({
+        id: index,
+        name: track.label || track.language || `Audio ${index + 1}`,
+        lang: track.language || "und",
+      }));
+      onAudioTracks(tracks);
+    };
+    video.addEventListener("loadedmetadata", reportTracks);
     return () => {
+      video.removeEventListener("loadedmetadata", reportTracks);
       video.pause();
       video.removeAttribute("src");
       video.load();
     };
-  }, [url]);
+  }, [url, onAudioTracks]);
+
+  // Apply the selected audio track whenever it changes.
+  useEffect(() => {
+    const list = videoRef.current?.audioTracks;
+    if (!list || list.length === 0) return;
+    for (let i = 0; i < list.length; i += 1) {
+      const track = list[i];
+      if (track) track.enabled = i === (activeAudioTrack ?? 0);
+    }
+    onAudioTrackSwitched?.(activeAudioTrack ?? 0);
+  }, [activeAudioTrack, onAudioTrackSwitched]);
+
   return (
     <video
       ref={videoRef}
@@ -218,29 +262,40 @@ export function PlayerModal() {
   const movieTitle = title?.title ?? "";
   const movieYear = title?.year ?? "";
 
-  // AoneRoom direct CDN streams (MP4 preview/trailer + authenticated episodes).
+  // MovieBox (AoneRoom) direct CDN streams. When the title carries an
+  // AoneRoom subjectId we resolve it directly; otherwise we search the
+  // public AoneRoom H5 API by title name so EVERY movie/TV show in the
+  // catalog surfaces a "MovieBox" server button in the player.
   const subjectId = title ? aoneRoomSubjectId(title) : null;
   const [aoneStreams, setAoneStreams] = useState<AoneRoomStream[]>([]);
   useEffect(() => {
-    if (!subjectId) {
+    if (!title) {
       setAoneStreams([]);
       return;
     }
     let cancelled = false;
-    resolveAoneRoomStreams(subjectId, {
-      se: playing?.episode?.seasonNumber,
-      ep: playing?.episode?.number,
-    })
-      .then((streams) => {
-        if (!cancelled) setAoneStreams(streams);
+    const onStreams = (streams: AoneRoomStream[]) => {
+      if (!cancelled) setAoneStreams(streams);
+    };
+    if (subjectId) {
+      resolveAoneRoomStreams(subjectId, {
+        se: playing?.episode?.seasonNumber,
+        ep: playing?.episode?.number,
       })
-      .catch(() => {
-        if (!cancelled) setAoneStreams([]);
-      });
+        .then(onStreams)
+        .catch(() => onStreams([]));
+    } else {
+      resolveAoneRoomStreamsByTitle(movieTitle, {
+        mediaType,
+      })
+        .then(({ streams }) => onStreams(streams))
+        .catch(() => onStreams([]));
+    }
     return () => {
       cancelled = true;
     };
-  }, [subjectId, playing?.episode?.seasonNumber, playing?.episode?.number]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subjectId, movieTitle, mediaType, playing?.episode?.seasonNumber, playing?.episode?.number]);
 
   const seasonNumber = playing?.episode?.seasonNumber ?? playing?.episode?.season ?? 1;
   const episodeNumber = playing?.episode?.number ?? playing?.episode?.episode ?? 1;
