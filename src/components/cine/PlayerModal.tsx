@@ -3,6 +3,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { ChevronLeft, ChevronRight, Languages, Loader2, Play, X } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { useCine } from "@/lib/cine/store";
+import { resolveAoneRoomStreams, type AoneRoomStream } from "@/lib/cine/aoneroom-streams";
 import type { MediaType, Title } from "@/lib/cine/types";
 
 export type AudioTrackInfo = {
@@ -15,9 +16,42 @@ type PlayerServer = {
   id: string;
   name: string;
   url: string;
-  kind?: "hls";
+  kind?: "hls" | "mp4";
   available?: boolean;
 };
+
+/** Extracts the numeric AoneRoom subjectId embedded in a title's external id. */
+function aoneRoomSubjectId(title: Title): string | null {
+  const match = /(?:aoneroom|moviebox)[:/-](\d{6,})/i.exec(title.id);
+  if (match) return match[1] ?? null;
+  const raw = (title as { subjectId?: unknown }).subjectId;
+  return typeof raw === "string" || typeof raw === "number" ? String(raw) : null;
+}
+
+function Mp4Video({ url }: { url: string }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.src = url;
+    void video.play().catch(() => {});
+    return () => {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    };
+  }, [url]);
+  return (
+    <video
+      ref={videoRef}
+      className="h-full w-full bg-black"
+      controls
+      autoPlay
+      playsInline
+      preload="metadata"
+    />
+  );
+}
 
 function cineJoyMovieUrl(
   tmdbId: string,
@@ -184,13 +218,45 @@ export function PlayerModal() {
   const movieTitle = title?.title ?? "";
   const movieYear = title?.year ?? "";
 
+  // AoneRoom direct CDN streams (MP4 preview/trailer + authenticated episodes).
+  const subjectId = title ? aoneRoomSubjectId(title) : null;
+  const [aoneStreams, setAoneStreams] = useState<AoneRoomStream[]>([]);
+  useEffect(() => {
+    if (!subjectId) {
+      setAoneStreams([]);
+      return;
+    }
+    let cancelled = false;
+    resolveAoneRoomStreams(subjectId, {
+      se: playing?.episode?.seasonNumber,
+      ep: playing?.episode?.number,
+    })
+      .then((streams) => {
+        if (!cancelled) setAoneStreams(streams);
+      })
+      .catch(() => {
+        if (!cancelled) setAoneStreams([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [subjectId, playing?.episode?.seasonNumber, playing?.episode?.number]);
+
   const seasonNumber = playing?.episode?.seasonNumber ?? playing?.episode?.season ?? 1;
   const episodeNumber = playing?.episode?.number ?? playing?.episode?.episode ?? 1;
 
   const servers = useMemo<PlayerServer[]>(() => {
-    if (!tmdbId || !mediaType) return [];
+    const aoneServers: PlayerServer[] = aoneStreams.map((stream) => ({
+      id: stream.id,
+      name: stream.name,
+      url: stream.src,
+      kind: stream.kind,
+      available: true,
+    }));
+    if (!tmdbId || !mediaType) return aoneServers;
     if (mediaType === "tv") {
       return [
+        ...aoneServers,
         {
           id: "vidlink",
           name: "VidLink Pro",
@@ -238,6 +304,7 @@ export function PlayerModal() {
     }
 
     return [
+      ...aoneServers,
       { id: "vidlink", name: "VidLink Pro", url: `https://vidlink.pro/movie/${tmdbId}` },
       { id: "embed-su", name: "Embed.su", url: `https://embed.su/embed/movie/${tmdbId}` },
       { id: "vidsrc", name: "VidSrc.cc", url: `https://vidsrc.cc/v2/embed/movie/${tmdbId}` },
@@ -270,7 +337,7 @@ export function PlayerModal() {
         available: true,
       },
     ];
-  }, [tmdbId, mediaType, seasonNumber, episodeNumber, movieTitle, movieYear]);
+  }, [tmdbId, mediaType, seasonNumber, episodeNumber, movieTitle, movieYear, aoneStreams]);
 
   const activeServerId =
     playing?.serverId === "cinejoy" ? "cinejoy-auto" : playing?.serverId;
@@ -285,6 +352,13 @@ export function PlayerModal() {
     setAudioTracks([]);
     setActiveAudioTrack(0);
   }, [active?.url]);
+
+  // Auto-select the first AoneRoom direct stream as soon as it resolves.
+  useEffect(() => {
+    if (playing && !playing.serverId && aoneStreams.length > 0) {
+      setServer(aoneStreams[0]!.id);
+    }
+  }, [aoneStreams, playing, setServer]);
 
   if (!playing || !title) return null;
 
@@ -403,6 +477,8 @@ export function PlayerModal() {
                   activeAudioTrack={activeAudioTrack}
                   onAudioTrackSwitched={setActiveAudioTrack}
                 />
+              ) : active?.kind === "mp4" ? (
+                <Mp4Video key={active.url} url={active.url} />
               ) : active ? (
                 <iframe
                   key={active.url}
