@@ -26,6 +26,7 @@ interface CineState {
   upgradePlayer: (title: Title) => void;
   failPlayer: (error: string) => void;
   setServer: (serverId: string) => void;
+  setEpisode: (episode: Episode) => void;
   closePlayer: () => void;
   setSettingsOpen: (open: boolean) => void;
 }
@@ -80,12 +81,17 @@ export const useCine = create<CineState>()(
         });
       },
       openPlayer: (title, episode) => {
+        const defaultEpisode =
+          episode ??
+          (title.mediaType === "tv"
+            ? { season: 1, episode: 1, title: "Season 1, Episode 1" }
+            : undefined);
         const servers = serversFor(title);
         const hasPreview = servers.some((server) => server.kind !== "prelude");
         set({
           playing: {
             title,
-            episode,
+            episode: defaultEpisode,
             serverId: servers[0]?.id ?? "prelude",
             loading: title.source === "tmdb" && !hasPreview,
           },
@@ -108,6 +114,8 @@ export const useCine = create<CineState>()(
         set((state) => (state.playing ? { playing: { ...state.playing, loading: false, error } } : state)),
       setServer: (serverId) =>
         set((state) => (state.playing ? { playing: { ...state.playing, serverId } } : state)),
+      setEpisode: (episode) =>
+        set((state) => (state.playing ? { playing: { ...state.playing, episode } } : state)),
       closePlayer: () => set({ playing: null }),
       setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
     }),

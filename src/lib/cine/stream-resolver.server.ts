@@ -55,23 +55,19 @@ export type ResolvedStream = {
   src: string;
   proxyPrefix: string;
   cacheKey: string;
+  server?: string;
+  playlistUrl?: string;
 };
 
-type CacheEntry = { uuid: string; expiresAt: number };
+type CacheEntry = {
+  playlistUrl: string;
+  server: string;
+  uuid?: string;
+  expiresAt: number;
+};
 
-const uuidCache = new Map<string, CacheEntry>();
-const inFlight = new Map<string, Promise<string>>();
-
-function titleSlug(title: string): string {
-  return title
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .replace(/-{2,}/g, "-");
-}
+const streamCache = new Map<string, CacheEntry>();
+const inFlight = new Map<string, Promise<CacheEntry>>();
 
 export function buildProviderPagePath(input: {
   mediaType: "movie" | "tv";
@@ -82,10 +78,9 @@ export function buildProviderPagePath(input: {
   episode?: number;
 }): string {
   if (input.mediaType === "tv") {
-    if (!Number.isInteger(input.season) || !Number.isInteger(input.episode)) {
-      throw new StreamResolveError("TV playback requires a season and episode number.", 400);
-    }
-    return `/watch/tv/${input.tmdbId}/${input.season}/${input.episode}`;
+    const season = input.season ?? 1;
+    const episode = input.episode ?? 1;
+    return `/watch/tv/${input.tmdbId}/${season}/${episode}`;
   }
   return `/watch/movie/${input.tmdbId}`;
 }
@@ -222,30 +217,41 @@ export async function resolvePlayableStream(input: {
   year?: string;
   season?: number;
   episode?: number;
+  server?: string;
 }): Promise<ResolvedStream> {
   const cacheKey =
     input.mediaType === "tv"
-      ? `tv:${input.tmdbId}:${input.season ?? 0}:${input.episode ?? 0}`
+      ? `tv:${input.tmdbId}:${input.season ?? 1}:${input.episode ?? 1}`
       : `movie:${input.tmdbId}`;
 
-  const cached = uuidCache.get(cacheKey);
+  const lookupKey = input.server ? `${cacheKey}:${input.server}` : cacheKey;
+
+  const cached = streamCache.get(lookupKey) ?? streamCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
-    return finalize(cached.uuid, cacheKey, input);
+    return finalize(cached, cacheKey, input);
   }
 
-  let pending = inFlight.get(cacheKey);
+  let pending = inFlight.get(lookupKey);
   if (!pending) {
     pending = (async () => {
       try {
         const wing = await resolveWingStream({
           mediaType: input.mediaType,
           tmdbId: input.tmdbId,
-          season: input.season,
-          episode: input.episode,
+          season: input.season ?? 1,
+          episode: input.episode ?? 1,
+          server: input.server,
         });
-        if (wing && wing.uuid) {
-          uuidCache.set(cacheKey, { uuid: wing.uuid, expiresAt: Date.now() + CACHE_TTL_MS });
-          return wing.uuid;
+        if (wing && wing.playlistUrl) {
+          const entry: CacheEntry = {
+            playlistUrl: wing.playlistUrl,
+            server: wing.server,
+            uuid: wing.uuid,
+            expiresAt: Date.now() + CACHE_TTL_MS,
+          };
+          streamCache.set(lookupKey, entry);
+          streamCache.set(cacheKey, entry);
+          return entry;
         }
       } catch (err) {
         console.warn("[stream-resolver] Native Wing resolution failed, trying fallback:", err);
@@ -254,36 +260,58 @@ export async function resolvePlayableStream(input: {
       const pageUrl = `${CINEJOY_ORIGIN}${buildProviderPagePath(input)}`;
       try {
         const uuid = await discoverUuid(cacheKey, pageUrl);
-        uuidCache.set(cacheKey, { uuid, expiresAt: Date.now() + CACHE_TTL_MS });
-        return uuid;
+        const fallbackUrl = `${UPSTREAM_ORIGIN}/hls/${uuid}/master.m3u8`;
+        const entry: CacheEntry = {
+          playlistUrl: fallbackUrl,
+          server: "nebula",
+          uuid,
+          expiresAt: Date.now() + CACHE_TTL_MS,
+        };
+        streamCache.set(lookupKey, entry);
+        streamCache.set(cacheKey, entry);
+        return entry;
       } catch (fallbackError) {
-        uuidCache.set(cacheKey, { uuid: "", expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS });
+        streamCache.set(lookupKey, {
+          playlistUrl: "",
+          server: "none",
+          expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS,
+        });
         throw fallbackError;
       }
-    })().finally(() => inFlight.delete(cacheKey));
+    })().finally(() => inFlight.delete(lookupKey));
 
-    inFlight.set(cacheKey, pending);
+    inFlight.set(lookupKey, pending);
   }
 
-  const uuid = await pending;
-  if (!uuid) {
+  const entry = await pending;
+  if (!entry || !entry.playlistUrl) {
     throw new StreamResolveError("No stream is currently available for this title.", 404);
   }
-  return finalize(uuid, cacheKey, input);
+  return finalize(entry, cacheKey, input);
 }
 
-function finalize(uuid: string, cacheKey: string, input: Parameters<typeof resolvePlayableStream>[0]): ResolvedStream {
-  const params = new URLSearchParams({ title: input.title, key: cacheKey });
+function finalize(
+  entry: CacheEntry,
+  cacheKey: string,
+  input: Parameters<typeof resolvePlayableStream>[0]
+): ResolvedStream {
+  const params = new URLSearchParams({
+    url: entry.playlistUrl,
+    title: input.title,
+    server: entry.server,
+  });
   if (/^\d{4}$/.test(input.year ?? "")) params.set("year", input.year!);
   if (input.mediaType === "tv") {
     params.set("season", String(input.season ?? 1));
     params.set("episode", String(input.episode ?? 1));
   }
-  const proxyPrefix = `${APP_PROXY_PREFIX}/hls/${uuid}/`;
+  const streamUrl = `${APP_PROXY_PREFIX}/stream?${params.toString()}`;
   return {
     kind: "hls",
-    src: `${proxyPrefix}master.m3u8?${params.toString()}`,
-    proxyPrefix,
+    src: streamUrl,
+    proxyPrefix: `${APP_PROXY_PREFIX}/stream?url=`,
     cacheKey,
+    server: entry.server,
+    playlistUrl: entry.playlistUrl,
   };
 }

@@ -2,9 +2,9 @@
 // Executes WebAssembly request sealing and WebCrypto AES-GCM decryption without browser dependencies.
 
 export type WingStreamResult = {
-  uuid: string;
+  uuid?: string;
   server: string;
-  playlistUrl?: string;
+  playlistUrl: string;
 };
 
 type WingWasmExports = {
@@ -192,10 +192,22 @@ export async function resolveWingStream(input: {
   tmdbId: number;
   season?: number;
   episode?: number;
+  server?: string;
 }): Promise<WingStreamResult | null> {
   const host = "https://api.wing.st";
 
-  for (const server of WING_SERVERS) {
+  const requested = input.server?.toLowerCase().trim();
+  const baseOrder =
+    input.mediaType === "tv"
+      ? ["lisbon", "solara", "nebula", "athens"]
+      : ["nebula", "lisbon", "solara", "athens"];
+
+  const serverOrder =
+    requested && (WING_SERVERS as readonly string[]).includes(requested)
+      ? [requested, ...baseOrder.filter((s) => s !== requested)]
+      : baseOrder;
+
+  for (const server of serverOrder) {
     try {
       let res: any;
       if (input.mediaType === "tv") {
@@ -214,15 +226,13 @@ export async function resolveWingStream(input: {
 
       if (res && res.status === 200 && res.data && Array.isArray(res.data.stream)) {
         for (const item of res.data.stream) {
-          if (item && item.playlist) {
+          if (item && typeof item.playlist === "string" && item.playlist.startsWith("http")) {
             const match = item.playlist.match(UUID_REGEX);
-            if (match) {
-              return {
-                uuid: match[1],
-                server,
-                playlistUrl: item.playlist,
-              };
-            }
+            return {
+              uuid: match ? match[1] : undefined,
+              server,
+              playlistUrl: item.playlist,
+            };
           }
         }
       }
